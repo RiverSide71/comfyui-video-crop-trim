@@ -11,12 +11,13 @@ const MODE_BAR_H  = 26;     // Height of the "Trim Mode" Seconds/Frames toggle b
 const PLAYBACK_H  = 36;     // Height of the play/pause + time/frame bar
 const TRIM_BAR_H  = 62;     // Height of the trim-range timeline (ruler + slider)
 const INFO_H      = 34;     // Height of the coordinate / metadata bar
-const WIDGET_H    = MODE_BAR_H + CANVAS_H + PLAYBACK_H + TRIM_BAR_H + INFO_H;
 const PAD         = 8;      // Horizontal padding inside the node
 const HANDLE_R    = 5;      // Corner-handle hit-radius in pixels
 const HANDLE_SZ   = 9;      // Corner-handle draw size
 const MIN_W       = 460;    // Minimum node width we enforce
 const CANVAS_PAD  = 14;     // Inset padding inside the preview canvas so crop guides have breathing room
+const ICONBAR_H   = 44;     // Height of the compact icon-button action row
+const ICONBAR_GAP = 6;      // Horizontal gap between icon buttons
 
 // ─── Colour palette ──────────────────────────────────────────────────────────
 const C = {
@@ -36,6 +37,10 @@ const C = {
     btnBg:       "#3a3a3a",
     btnHover:    "#484848",
     btnText:     "#c8c8c8",
+    iconActiveBg:   "#c87d1a",   // Active/toggled icon-button fill
+    iconActiveBord: "#e8a02a",   // Active/toggled icon-button border
+    iconActiveText: "#1c1508",   // Text/icon colour on the active fill
+    iconHoverText:  "#ffffff",   // Text/icon colour on hover
     pbBar:       "#232323",       // Playback bar background
     pbProgress:  "#e8a02a",       // Progress bar fill
     pbTrack:     "#3a3a3a",       // Progress bar track
@@ -48,6 +53,32 @@ const C = {
 // ─── Utility ─────────────────────────────────────────────────────────────────
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const even  = v => Math.round(v) % 2 === 0 ? Math.round(v) : Math.round(v) - 1;
+
+// Greedily word-wrap `text` to fit within `maxWidth` using ctx's current font.
+// Never breaks a single word. Returns an array of lines (length 1 if the
+// whole string already fits).
+function wrapTextLines(ctx, text, maxWidth) {
+    const words = text.split(" ");
+    const lines = [];
+    let line = "";
+    for (const w of words) {
+        const test = line ? `${line} ${w}` : w;
+        if (line && ctx.measureText(test).width > maxWidth) {
+            lines.push(line);
+            line = w;
+        } else {
+            line = test;
+        }
+    }
+    if (line) lines.push(line);
+    return lines;
+}
+
+// Offscreen canvas shared by every node instance, used only to measure text
+// widths (ctx.measureText) when computing the info bar's required width.
+// Never drawn to the screen.
+const _measureCanvas = document.createElement("canvas");
+const _measureCtx    = _measureCanvas.getContext("2d");
 
 // ─── Crop aspect-ratio presets ───────────────────────────────────────────────
 // val: 0 = Freeform (no lock), -1 = Original (locked to the loaded video's
@@ -145,13 +176,53 @@ app.registerExtension({
         // ── Per-node state ──────────────────────────────────────────────────
         let previewImg  = null;
         let videoInfo   = { width: 0, height: 0, fps: 30, duration: 0, nb_frames: 0, has_audio: false, audio_codec: null, audio_sample_rate: 0, audio_channels: 0 };
+        let dynamicMinW = MIN_W;
 
-        // Canvas height grows when the node is enlarged; the playback bar,
-        // trim bar, and info bar heights are always fixed.
-        let dynamicCanvasH = CANVAS_H;
+        // Growable-widget layout: LiteGraph allocates the actual height through
+        // widget.computedHeight. These controls consume the fixed portion.
+        // The mode bar's own height is width-dependent (it can wrap to two
+        // rows), so the fixed portion — and therefore the canvas height it
+        // leaves behind — is recomputed per current node width rather than
+        // being a static constant.
+        const getCanvasH = (widget, nodeWidth) => {
+            const h = Number(widget?.computedHeight);
+            const fixedH = getModeBarH(nodeWidth) + PLAYBACK_H + TRIM_BAR_H + INFO_H;
+            return Number.isFinite(h)
+                ? Math.max(CANVAS_H, h - fixedH)
+                : CANVAS_H;
+        };
 
-        // Tracks last-seen node dimensions so draw() can detect a resize even
-        // when onResize hasn't fired yet (e.g. mid-drag in some ComfyUI builds).
+        function recalcInfoBarMinW() {
+            const ctx = _measureCtx;
+
+            ctx.font = "11px monospace";
+            const coordText = videoInfo.width > 0
+                ? `x:${videoInfo.width} y:${videoInfo.height} w:${videoInfo.width} h:${videoInfo.height}`
+                : "x:0 y:0 w:512 h:512";
+            const coordW = ctx.measureText(coordText).width;
+
+            let metaW = 0, audioW = 0;
+            if (videoInfo.width > 0) {
+                const meta = `${videoInfo.width}×${videoInfo.height}  ${videoInfo.fps.toFixed(3)} fps  ${videoInfo.duration.toFixed(2)} s`;
+                ctx.font = "11px monospace";
+                metaW = ctx.measureText(meta).width;
+
+                const audioIcon  = videoInfo.has_audio ? "🔊" : "🔇";
+                const audioLabel = videoInfo.has_audio
+                    ? ` ${(videoInfo.audio_codec || "audio").toUpperCase()} ${videoInfo.audio_channels === 1 ? "mono" : "stereo"} ${(videoInfo.audio_sample_rate / 1000).toFixed(1)}kHz`
+                    : " no audio";
+                ctx.font = "10px 'Segoe UI', sans-serif";
+                audioW = ctx.measureText(audioIcon + audioLabel).width;
+            }
+
+            const GAP    = 10;   // min breathing room either side of the audio badge
+            const SIDE   = 6;    // inset from each edge of the info bar
+            const MARGIN = 8;    // safety buffer for font-metric differences across systems
+            const sideW  = Math.max(coordW, metaW);
+            const required = Math.ceil(audioW + 2 * (PAD + SIDE + GAP + sideW) + MARGIN);
+            dynamicMinW = Math.max(MIN_W, required);
+        }
+
         let lastNodeW = 0;
         let lastNodeH = 0;
 
@@ -163,79 +234,88 @@ app.registerExtension({
         let progBarX   = 0;
         let progBarW   = 0;
         let progBarY   = 0;
-
-        // ── "Trim Mode" toggle state (replaces the native trim_mode combo) ──
-        // Cached bounding rect of the first ("Seconds") segment; the second
-        // ("Frames") segment sits immediately to its right.
         let modeToggleX      = 0;
         let modeToggleY      = 0;
         let modeToggleSegW   = 0;
         let modeToggleSegH   = 0;
         let modeToggleSegGap = 0;
-
-        // Trim playback mode: when true, playback is bounded to [trim_start, trim_end]
         let trimPlaybackMode = false;
-
-        // ── "Crop" aspect-ratio button + dropdown state ──────────────────────
         let selectedAspect     = ASPECT_RATIOS[0];   // Freeform until a video loads
         let aspectDropdownOpen = false;
-        // Cached bounding rect of the "Crop" button (drawn opposite Trim Mode)
         let cropBtnX = 0, cropBtnY = 0, cropBtnW = 0, cropBtnH = 0;
-        // Cached bounding rect of the dropdown list (drawn as an overlay, only
-        // valid while aspectDropdownOpen is true)
         let dropdownX = 0, dropdownY = 0, dropdownW = 0, dropdownH = 0;
-
-        // ── "Resize" method button + dropdown state (drawn immediately to
-        // the left of the "Crop" button) ─────────────────────────────────
         let selectedResizeMethod = RESIZE_METHODS[0];   // "Crop" by default
         let resizeDropdownOpen   = false;
-        // Cached bounding rect of the "Resize" button
         let resizeBtnX = 0, resizeBtnY = 0, resizeBtnW = 0, resizeBtnH = 0;
-        // Cached bounding rect of the resize-method dropdown list overlay
         let resizeDropdownX = 0, resizeDropdownY = 0, resizeDropdownW = 0, resizeDropdownH = 0;
-
-        // ── Trim timeline state (scrubbing slider below playback bar) ───────
-        // Cached bounding rect of the timeline slider box (node-local coords)
         let sliderBarX  = 0;
         let sliderBarW  = 0;
         let sliderBarY  = 0;
         let sliderBarH  = 0;
-        // Which timeline handle is being dragged: null | "start" | "end" | "center"
         let timelineDrag       = null;
         let timelineDragOffset = 0;    // offset from handle to mouse (for "center" pan)
         let timelineDragWidth  = 0;    // selection width at drag-start (for "center" pan)
-
-        // Display-space transform (image px → node-local px)
-        // Updated every draw call so mouse handler can use them.
         let dScale  = 1;
         let dOffX   = 0;   // In node-local coords
         let dOffY   = 0;   // In node-local coords (includes widget.last_y)
         let dWidth  = 0;
         let dHeight = 0;
-
-        // Drag / preview state
         let cropPreviewMode = false;  // true = canvas shows only the cropped region
         let dragMode        = null;   // null | "create" | "move" | "tl" | "tr" | "bl" | "br"
         let dragAnchor = null;  // { x, y } in node-local coords where drag began
         let dragCrop   = null;  // snapshot of crop at drag-start
 
+        // ── Mode-bar responsive layout ───────────────────────────────────────
+        // The mode bar packs a left cluster ("Trim Mode" + Seconds/Frames) and
+        // a right cluster ("Resize"/"Crop" buttons) into one row. As the node
+        // gets too narrow to fit things without overlap, the bar grows rows:
+        //   1 row  — everything fits side-by-side (original layout).
+        //   2 rows — Trim Mode on row 1; Resize+Crop together on row 2.
+        //   3 rows — Trim Mode on row 1; Resize alone on row 2; Crop alone on
+        //            row 3 (row 2 wasn't wide enough for both buttons).
+        // These helpers use the shared off-screen measuring context, so they
+        // can be called from draw(), mouse(), and computeLayoutSize() alike
+        // without needing a live ctx.
+        function modeBarLeftW(ctx) {
+            ctx.font = "bold 11px 'Segoe UI', sans-serif";
+            const modeLabelW = ctx.measureText("Trim Mode").width;
+            return 8 + modeLabelW + 4 + (54 * 2 + 2);   // label + gap + two 54px segments
+        }
+        function modeBarResizeW(ctx) {
+            ctx.font = "11px 'Segoe UI', sans-serif";
+            return ctx.measureText(`Resize: ${selectedResizeMethod.name}  ▾`).width + 16;
+        }
+        function modeBarCropW(ctx) {
+            ctx.font = "11px 'Segoe UI', sans-serif";
+            return ctx.measureText(`⛶  Crop: ${selectedAspect.name}  ▾`).width + 16;
+        }
+        function getModeBarRows(nodeWidth) {
+            const ctx           = _measureCtx;
+            // Width usable by one row's content, after an 8px margin on each
+            // side plus 8px of breathing room (matches the 8px gap the
+            // buttons already use between each other / the row edge).
+            const rowAvailable  = nodeWidth - PAD * 2 - 16;
+            const leftW         = modeBarLeftW(ctx);
+            const rightW        = modeBarResizeW(ctx) + 8 + modeBarCropW(ctx);
+            if (leftW + rightW <= rowAvailable) return 1;
+            if (rightW <= rowAvailable) return 2;
+            return 3;
+        }
+        function getModeBarH(nodeWidth) {
+            return MODE_BAR_H * getModeBarRows(nodeWidth);
+        }
+
         // ── Widget-finding helpers ──────────────────────────────────────────
         const gw = name => node.widgets?.find(w => w.name === name);
 
         // ── Apply sticky last-used settings (falls back to class defaults) ──
-        // If a saved workflow loads this node, ComfyUI's configure() call
-        // (which runs after nodeCreated) will overwrite these with the
-        // workflow's own values, so this only affects genuinely new nodes.
+
         {
             const sticky = loadStickySettings();
             for (const name of STICKY_WIDGETS) {
                 const w = gw(name);
                 if (!w) continue;
-
                 if (name === "quality") {
-                    // Numeric widget — only accept a finite in-range value
-                    // from storage; clamp it, and self-heal if the widget's
-                    // own current value is already broken (e.g. NaN).
                     if (Object.prototype.hasOwnProperty.call(sticky, "quality")) {
                         const n = Number(sticky.quality);
                         if (Number.isFinite(n)) w.value = clamp(Math.round(n), 0, 51);
@@ -261,11 +341,6 @@ app.registerExtension({
             node.setDirtyCanvas(true, true);
         }
 
-        // Return the best available timeline duration in seconds:
-        //  1. Live video element duration (most authoritative)
-        //  2. video_duration widget value (set by UI on load)
-        //  3. Highest of trim_start / trim_end values (fallback)
-        //  4. 1.0 floor so the empty timeline still renders
         const getActiveDuration = () => {
             if (videoEl && videoEl.duration > 0) return videoEl.duration;
             const durW = gw("video_duration");
@@ -276,7 +351,6 @@ app.registerExtension({
             return maxVal > 0 ? Math.max(maxVal, 1.0) : 1.0;
         };
 
-        // Return trim start/end in seconds, converting from frames if needed.
         const getTrimSeconds = () => {
             const mode = gw("trim_mode")?.value ?? "seconds";
             const fps  = videoInfo.fps || gw("fps")?.value || 30;
@@ -288,7 +362,6 @@ app.registerExtension({
             return { start: s, end: e };
         };
 
-        // Write trim start/end back, converting to frames if needed.
         const setTrimSeconds = (startS, endS) => {
             const mode = gw("trim_mode")?.value ?? "seconds";
             const fps  = videoInfo.fps || gw("fps")?.value || 30;
@@ -301,7 +374,6 @@ app.registerExtension({
                 if (sw) sw.value = Math.round(startS * 100) / 100;
                 if (ew) ew.value = Math.round(endS   * 100) / 100;
             }
-            // "none" mode — nothing to write
             node.setDirtyCanvas(true, false);
         };
 
@@ -326,8 +398,6 @@ app.registerExtension({
             node.setDirtyCanvas(true, false);
         };
 
-        // Resolve the currently-selected aspect preset to a numeric W/H ratio.
-        // Returns 0 for Freeform (i.e. no lock should be applied).
         const getEffectiveRatio = () => {
             if (!selectedAspect || selectedAspect.val === 0) return 0;
             if (selectedAspect.val === -1) {
@@ -337,9 +407,6 @@ app.registerExtension({
             return selectedAspect.val;
         };
 
-        // Re-fit the current crop rectangle to a given aspect ratio preset,
-        // keeping it centred on the crop's current centre and as large as
-        // possible within the video frame.
         const applyAspectRatio = (ratioObj) => {
             if (!videoInfo.width || !videoInfo.height) return;
             if (!ratioObj || ratioObj.val === 0) return;   // Freeform: leave as-is
@@ -368,7 +435,6 @@ app.registerExtension({
         // ── Playback helpers ────────────────────────────────────────────────
         function scheduleRaf() {
             if (!isPlaying) return;
-            // Enforce trim_end boundary during trim playback
             if (trimPlaybackMode && videoEl && videoEl.duration > 0) {
                 const { end } = getTrimSeconds();
                 const effectiveEnd = (end > 0) ? Math.min(end, videoEl.duration) : videoEl.duration;
@@ -422,7 +488,6 @@ app.registerExtension({
         }
 
         // ── Coordinate conversions ──────────────────────────────────────────
-        // All values in *node-local* coordinates (origin = node top-left).
         const imgToNode = (ix, iy) => ({
             x: ix * dScale + dOffX,
             y: iy * dScale + dOffY,
@@ -433,12 +498,6 @@ app.registerExtension({
         });
 
         // ── Hit-test helper ─────────────────────────────────────────────────
-        /**
-         * Given a node-local cursor position, return the drag mode:
-         *   "tl" | "tr" | "bl" | "br"  → corner handle
-         *   "move"                       → inside the crop rectangle
-         *   "create"                     → anywhere else
-         */
         const hitTest = (nx, ny) => {
             const c  = getCrop();
             const tl = imgToNode(c.x,       c.y);
@@ -472,29 +531,28 @@ app.registerExtension({
             name:    "visual_crop",
             value:   null,
             options: { serialize: false },
-            last_y:  0,     // Y of this widget's top inside the node (set each draw)
+            last_y:  0,
 
-            computeSize(nodeWidth) {
-                // Return the current dynamic total so ComfyUI's layout engine
-                // always allocates exactly the right height for this widget.
-                return [nodeWidth, MODE_BAR_H + dynamicCanvasH + PLAYBACK_H + TRIM_BAR_H + INFO_H];
+            // IMPORTANT: use computeLayoutSize(), not computeSize().
+            // In ComfyUI's current LiteGraph, computeSize() widgets are fixed
+            // height and can cause the node itself to grow to accommodate them.
+            // computeLayoutSize() makes this widget grow into the node's existing
+            // free space instead, so node height never feeds back into sizing.
+            computeLayoutSize() {
+                return {
+                    minHeight: getModeBarH(node.size[0]) + CANVAS_H + PLAYBACK_H + TRIM_BAR_H + INFO_H,
+                    minWidth: 0,
+                };
             },
 
             draw(ctx, node, nodeWidth, y /*, _h */) {
                 this.last_y = y;
+                const canvasH = getCanvasH(this, nodeWidth);
 
-                // ── Sync dynamicCanvasH whenever the node has been resized ──
-                // onResize handles the primary update path, but ComfyUI may call
-                // computeSize() before onResize() fires during a live drag.
-                // Checking here (every frame) catches those in-between states so
-                // the video and crop guide always fill the current node size.
-                const curW = node.size[0];
-                const curH = node.size[1];
-                if (curW !== lastNodeW || curH !== lastNodeH) {
-                    lastNodeW = curW;
-                    lastNodeH = curH;
-                    recalcCanvasH(curW, curH);
-                }
+                // Do NOT recalculate canvasH here. draw() must consume the
+                // same cached height that computeSize() just reported to LiteGraph.
+                // Recalculating from node.size during draw creates a one-frame
+                // layout/drawing mismatch and causes the widgets below to overlap.
 
                 const W  = nodeWidth - PAD * 2;   // usable width
                 const x0 = PAD;                    // left edge
@@ -504,8 +562,8 @@ app.registerExtension({
                 ctx.fillStyle   = C.bg;
                 ctx.strokeStyle = C.bgBorder;
                 ctx.lineWidth   = 1;
-                ctx.fillRect(x0, y0, W, dynamicCanvasH);
-                ctx.strokeRect(x0, y0, W, dynamicCanvasH);
+                ctx.fillRect(x0, y0, W, canvasH);
+                ctx.strokeRect(x0, y0, W, canvasH);
 
                 // Decide which image source to paint (live video or static first-frame)
                 const imgSrc = (videoEl && videoEl.readyState >= 2) ? videoEl : previewImg;
@@ -519,20 +577,17 @@ app.registerExtension({
                     const c = getCrop();
 
                     if (cropPreviewMode) {
-                        // ── Crop-preview mode: fill canvas with cropped region ──
-                        // Letterbox the crop rect into the available canvas area
-                        // so the user sees exactly what the output frame will look like.
                         const cropAspect   = c.w / c.h;
-                        const canvasAspect = W   / dynamicCanvasH;
+                        const canvasAspect = W   / canvasH;
                         let destW, destH, destX, destY;
                         if (cropAspect > canvasAspect) {
                             destW = W;
                             destH = W / cropAspect;
                             destX = x0;
-                            destY = y0 + (dynamicCanvasH - destH) / 2;
+                            destY = y0 + (canvasH - destH) / 2;
                         } else {
-                            destH = dynamicCanvasH;
-                            destW = dynamicCanvasH * cropAspect;
+                            destH = canvasH;
+                            destW = canvasH * cropAspect;
                             destX = x0 + (W - destW) / 2;
                             destY = y0;
                         }
@@ -567,7 +622,7 @@ app.registerExtension({
                         ctx.font      = "10px 'Segoe UI', sans-serif";
                         ctx.fillStyle = C.infoDim;
                         ctx.textAlign = "center";
-                        ctx.fillText("CROP OUTPUT PREVIEW", x0 + W / 2, y0 + dynamicCanvasH - 6);
+                        ctx.fillText("CROP OUTPUT PREVIEW", x0 + W / 2, y0 + canvasH - 6);
                         ctx.textAlign = "left";
 
                         // "TRIMMED OUTPUT PREVIEW" secondary label when also in trim mode
@@ -575,21 +630,16 @@ app.registerExtension({
                             ctx.font      = "10px 'Segoe UI', sans-serif";
                             ctx.fillStyle = "rgba(232,160,42,0.55)";
                             ctx.textAlign = "center";
-                            ctx.fillText("✂  TRIMMED OUTPUT PREVIEW", x0 + W / 2, y0 + dynamicCanvasH - 18);
+                            ctx.fillText("✂  TRIMMED OUTPUT PREVIEW", x0 + W / 2, y0 + canvasH - 18);
                             ctx.textAlign = "left";
                         }
 
                         // Set display transform to safe no-op so mouse handler
-                        // boundary checks still pass cleanly (drag is blocked below).
-                        dScale = 1; dOffX = x0; dOffY = y0; dWidth = W; dHeight = dynamicCanvasH;
+                        dScale = 1; dOffX = x0; dOffY = y0; dWidth = W; dHeight = canvasH;
 
                     } else {
-                        // ── Normal mode: full-frame view with crop overlay ──────
-                        // Compute display transform — inset by CANVAS_PAD on every
-                        // side so crop handles and dashed guidelines are never flush
-                        // against the canvas border.
                         const innerW = W - CANVAS_PAD * 2;
-                        const innerH = dynamicCanvasH - CANVAS_PAD * 2;
+                        const innerH = canvasH - CANVAS_PAD * 2;
                         const sX = innerW / naturalW;
                         const sY = innerH / naturalH;
                         dScale  = Math.min(sX, sY);
@@ -643,37 +693,59 @@ app.registerExtension({
                             ctx.font      = "10px 'Segoe UI', sans-serif";
                             ctx.fillStyle = "rgba(232,160,42,0.55)";
                             ctx.textAlign = "center";
-                            ctx.fillText("✂  TRIMMED OUTPUT PREVIEW", x0 + W / 2, y0 + dynamicCanvasH - 18);
+                            ctx.fillText("✂  TRIMMED OUTPUT PREVIEW", x0 + W / 2, y0 + canvasH - 18);
                             ctx.textAlign = "left";
                         }
                     }
 
                 } else {
-                    // ── Placeholder ─────────────────────────────────────
-                    // Reset display transform to identity so mouse events are
-                    // safely rejected (previewImg is null check handles it)
                     dOffX = x0; dOffY = y0; dScale = 1;
 
-                    ctx.fillStyle = C.placeholder;
-                    ctx.font      = "13px 'Segoe UI', sans-serif";
+                    const mainText = "Upload a video using the button below to get started.";
+                    const subText  = "- or connect IMAGE/AUDIO to the  images  /  audio  inputs -";
+                    const maxTextW = Math.max(80, W - CANVAS_PAD * 2);
+
+                    ctx.font = "13px 'Segoe UI', sans-serif";
+                    const mainLines = wrapTextLines(ctx, mainText, maxTextW);
+                    ctx.font = "11px monospace";
+                    const subLines  = wrapTextLines(ctx, subText, maxTextW);
+
                     ctx.textAlign = "center";
-                    ctx.fillText(
-                        "Upload a video using the button below to get started.",
-                        x0 + W / 2,
-                        y0 + dynamicCanvasH / 2 - 10,
-                    );
-                    ctx.fillStyle = C.placeholderS;
-                    ctx.font      = "11px monospace";
-                    ctx.fillText(
-                        "- or connect IMAGE/AUDIO to the  images  /  audio  inputs -",
-                        x0 + W / 2,
-                        y0 + dynamicCanvasH / 2 + 12,
-                    );
+                    if (mainLines.length <= 1 && subLines.length <= 1) {
+                        // Fits on one line each — keep the original, exact layout.
+                        ctx.fillStyle = C.placeholder;
+                        ctx.font      = "13px 'Segoe UI', sans-serif";
+                        ctx.fillText(mainText, x0 + W / 2, y0 + canvasH / 2 - 10);
+                        ctx.fillStyle = C.placeholderS;
+                        ctx.font      = "11px monospace";
+                        ctx.fillText(subText, x0 + W / 2, y0 + canvasH / 2 + 12);
+                    } else {
+                        // Squeezed: wrap onto multiple lines and re-center as a block
+                        // so the text stays inside the canvas instead of overflowing it.
+                        const MAIN_LH = 16, SUB_LH = 14, BLOCK_GAP = 8;
+                        const totalH = mainLines.length * MAIN_LH + BLOCK_GAP + subLines.length * SUB_LH;
+                        let ly = y0 + canvasH / 2 - totalH / 2 + MAIN_LH * 0.8;
+
+                        ctx.fillStyle = C.placeholder;
+                        ctx.font      = "13px 'Segoe UI', sans-serif";
+                        for (const line of mainLines) {
+                            ctx.fillText(line, x0 + W / 2, ly);
+                            ly += MAIN_LH;
+                        }
+
+                        ly += BLOCK_GAP - MAIN_LH + SUB_LH * 0.8;
+                        ctx.fillStyle = C.placeholderS;
+                        ctx.font      = "11px monospace";
+                        for (const line of subLines) {
+                            ctx.fillText(line, x0 + W / 2, ly);
+                            ly += SUB_LH;
+                        }
+                    }
                     ctx.textAlign = "left";
                 }
 
                 // ── Playback bar ─────────────────────────────────────────
-                const py = y0 + dynamicCanvasH;
+                const py = y0 + canvasH;
                 ctx.fillStyle   = C.pbBar;
                 ctx.strokeStyle = C.bgBorder;
                 ctx.lineWidth   = 1;
@@ -681,13 +753,6 @@ app.registerExtension({
                 ctx.strokeRect(x0, py, W, PLAYBACK_H);
 
                 const hasVideo = !!videoEl;
-
-                // ── Playback bar layout ──────────────────────────────────
-                // Row 1 (top half): ▶/⏸ button  |  time label  |  (spacer)
-                // Row 2 (bottom):   full-width progress track (x0→x0+W)
-                //
-                // The progress track spans the full inner width so its pixel
-                // positions match the trim-timeline ruler 1-to-1.
                 const _TL_PAD = 8;
                 const pbTrackH  = 4;
                 const pbTrackY  = py + PLAYBACK_H - pbTrackH - 1;  // flush to bottom of bar
@@ -844,12 +909,11 @@ app.registerExtension({
                 ctx.textAlign = "left";
 
                 // ── Trim timeline ────────────────────────────────────────
-                // A scrubbing panel with a time/frame ruler and a dual-handle
-                // range slider that directly drives trim_start / trim_end.
-                const ty = py + PLAYBACK_H;    // top of the trim timeline area
-                const RULER_H  = 22;           // ruler height inside trim area
-                const SBOX_H   = 24;           // slider box height
-                const TL_PAD   = 8;            // inner horizontal padding
+
+                const ty = py + PLAYBACK_H;
+                const RULER_H  = 22;
+                const SBOX_H   = 24;
+                const TL_PAD   = 8;
                 const trimBg   = "#1a1a1a";
                 const trimBord = "#2e2e2e";
 
@@ -859,9 +923,6 @@ app.registerExtension({
                 ctx.fillRect(x0, ty, W, TRIM_BAR_H);
                 ctx.strokeRect(x0, ty, W, TRIM_BAR_H);
 
-                // tl_x / tl_w define the shared horizontal track extents.
-                // The playback bar track (above) is drawn using these same
-                // values so the scrub head always lines up with the ruler.
                 const tl_x = x0 + TL_PAD;
                 const tl_w = W - TL_PAD * 2;
                 const activeDur = getActiveDuration();
@@ -966,12 +1027,27 @@ app.registerExtension({
                 }
 
                 // ── "Trim Mode" toggle bar (replaces the native trim_mode combo) ──
-                const mbY = ty + TRIM_BAR_H;
+                // Grows to 2 or 3 rows when the node is too narrow — see the
+                // getModeBarRows() comment above for the tiers.
+                const mbY         = ty + TRIM_BAR_H;
+                const modeBarRows = getModeBarRows(nodeWidth);
+                const modeBarH    = MODE_BAR_H * modeBarRows;
+
                 ctx.fillStyle   = C.infoBar;
                 ctx.strokeStyle = C.bgBorder;
                 ctx.lineWidth   = 1;
-                ctx.fillRect(x0, mbY, W, MODE_BAR_H);
-                ctx.strokeRect(x0, mbY, W, MODE_BAR_H);
+                ctx.fillRect(x0, mbY, W, modeBarH);
+                ctx.strokeRect(x0, mbY, W, modeBarH);
+                if (modeBarRows >= 2) {
+                    ctx.beginPath();
+                    ctx.moveTo(x0, mbY + MODE_BAR_H);
+                    ctx.lineTo(x0 + W, mbY + MODE_BAR_H);
+                    if (modeBarRows === 3) {
+                        ctx.moveTo(x0, mbY + MODE_BAR_H * 2);
+                        ctx.lineTo(x0 + W, mbY + MODE_BAR_H * 2);
+                    }
+                    ctx.stroke();
+                }
 
                 const modeLabel = "Trim Mode";
                 ctx.font         = "bold 11px 'Segoe UI', sans-serif";
@@ -1010,34 +1086,34 @@ app.registerExtension({
                 ctx.textAlign    = "left";
                 ctx.textBaseline = "alphabetic";
 
-                // ── "Crop" aspect-ratio button (right side, opposite Trim Mode) ──
-                const cropLabel = `⛶  Crop: ${selectedAspect.name}  ▾`;
-                ctx.font = "11px 'Segoe UI', sans-serif";
-                const cropLabelW = ctx.measureText(cropLabel).width;
-                cropBtnW = cropLabelW + 16;
-                cropBtnH = segH;
-                cropBtnX = x0 + W - 8 - cropBtnW;
-                cropBtnY = segY;
-
-                ctx.fillStyle = aspectDropdownOpen ? C.pbBtn : C.btnBg;
-                ctx.beginPath();
-                ctx.roundRect(cropBtnX, cropBtnY, cropBtnW, cropBtnH, 4);
-                ctx.fill();
-                ctx.fillStyle    = aspectDropdownOpen ? C.bg : C.btnText;
-                ctx.textAlign    = "center";
-                ctx.textBaseline = "middle";
-                ctx.fillText(cropLabel, cropBtnX + cropBtnW / 2, cropBtnY + cropBtnH / 2 + 1);
-                ctx.textAlign    = "left";
-                ctx.textBaseline = "alphabetic";
-
-                // ── "Resize" method button (immediately left of "Crop") ──────
+                // ── "Resize"/"Crop" buttons (right side, opposite Trim Mode) ─────
+                // rows===1: share row 1 with Trim Mode, right-aligned (original layout).
+                // rows===2: share their own row 2, right-aligned as a pair — this
+                //           only happens when the pair is known to fit (see
+                //           getModeBarRows), so no clamping is needed here.
+                // rows===3: row 2 wasn't wide enough for both, so each button
+                //           gets its own row, right-aligned individually.
+                const cropLabel   = `⛶  Crop: ${selectedAspect.name}  ▾`;
                 const resizeLabel = `Resize: ${selectedResizeMethod.name}  ▾`;
                 ctx.font = "11px 'Segoe UI', sans-serif";
-                const resizeLabelW = ctx.measureText(resizeLabel).width;
-                resizeBtnW = resizeLabelW + 16;
+                cropBtnW   = ctx.measureText(cropLabel).width + 16;
+                resizeBtnW = ctx.measureText(resizeLabel).width + 16;
+                cropBtnH   = segH;
                 resizeBtnH = segH;
-                resizeBtnX = cropBtnX - 8 - resizeBtnW;
-                resizeBtnY = segY;
+
+                let resizeRowY, cropRowY;
+                if (modeBarRows === 3) {
+                    resizeRowY = mbY + MODE_BAR_H;
+                    cropRowY   = mbY + MODE_BAR_H * 2;
+                    resizeBtnX = x0 + W - 8 - resizeBtnW;
+                    cropBtnX   = x0 + W - 8 - cropBtnW;
+                } else {
+                    resizeRowY = cropRowY = modeBarRows === 2 ? mbY + MODE_BAR_H : mbY;
+                    cropBtnX   = x0 + W - 8 - cropBtnW;
+                    resizeBtnX = cropBtnX - 8 - resizeBtnW;
+                }
+                resizeBtnY = resizeRowY + 4;
+                cropBtnY   = cropRowY + 4;
 
                 ctx.fillStyle = resizeDropdownOpen ? C.pbBtn : C.btnBg;
                 ctx.beginPath();
@@ -1050,8 +1126,19 @@ app.registerExtension({
                 ctx.textAlign    = "left";
                 ctx.textBaseline = "alphabetic";
 
+                ctx.fillStyle = aspectDropdownOpen ? C.pbBtn : C.btnBg;
+                ctx.beginPath();
+                ctx.roundRect(cropBtnX, cropBtnY, cropBtnW, cropBtnH, 4);
+                ctx.fill();
+                ctx.fillStyle    = aspectDropdownOpen ? C.bg : C.btnText;
+                ctx.textAlign    = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(cropLabel, cropBtnX + cropBtnW / 2, cropBtnY + cropBtnH / 2 + 1);
+                ctx.textAlign    = "left";
+                ctx.textBaseline = "alphabetic";
+
                 // ── Info bar ────────────────────────────────────────────
-                const iy = mbY + MODE_BAR_H;
+                const iy = mbY + modeBarH;
                 ctx.fillStyle   = C.infoBar;
                 ctx.strokeStyle = C.bgBorder;
                 ctx.lineWidth   = 1;
@@ -1061,36 +1148,52 @@ app.registerExtension({
                 const c = getCrop();
                 ctx.fillStyle = C.infoText;
                 ctx.font      = "11px monospace";
-                ctx.fillText(
-                    `  x: ${c.x}  y: ${c.y}  w: ${c.w}  h: ${c.h}`,
-                    x0 + 6,
-                    iy + INFO_H / 2 + 4,
-                );
+                const coordText = `x:${c.x} y:${c.y} w:${c.w} h:${c.h}`;
+                ctx.fillText(coordText, x0 + 6, iy + INFO_H / 2 + 4);
+                const coordEndX = x0 + 6 + ctx.measureText(coordText).width;
 
                 if (videoInfo.width > 0) {
                     // ── Right-aligned video metadata ────────────────────
-                    const meta = `${videoInfo.width}×${videoInfo.height}  ${videoInfo.fps.toFixed(3)} fps  ${videoInfo.duration.toFixed(2)} s  `;
+                    ctx.font = "11px monospace";
+                    const meta = `${videoInfo.width}×${videoInfo.height}  ${videoInfo.fps.toFixed(3)} fps  ${videoInfo.duration.toFixed(2)} s`;
                     ctx.fillStyle = C.infoDim;
                     const tw = ctx.measureText(meta).width;
-                    ctx.fillText(meta, x0 + W - tw - 2, iy + INFO_H / 2 + 4);
+                    const metaStartX = x0 + W - tw - 6;
+                    ctx.fillText(meta, metaStartX, iy + INFO_H / 2 + 4);
 
                     // ── Centred audio badge ─────────────────────────────
                     const audioIcon  = videoInfo.has_audio ? "🔊" : "🔇";
                     const audioLabel = videoInfo.has_audio
-                        ? ` ${(videoInfo.audio_codec || "audio").toUpperCase()}  ${videoInfo.audio_channels === 1 ? "mono" : "stereo"}  ${(videoInfo.audio_sample_rate / 1000).toFixed(1)} kHz`
-                        : "  no audio";
-                    ctx.font      = "10px 'Segoe UI', sans-serif";
-                    ctx.fillStyle = videoInfo.has_audio ? C.infoText : C.infoDim;
-                    ctx.textAlign = "center";
-                    ctx.fillText(audioIcon + audioLabel, x0 + W / 2, iy + INFO_H / 2 + 4);
-                    ctx.textAlign = "left";
+                        ? ` ${(videoInfo.audio_codec || "audio").toUpperCase()} ${videoInfo.audio_channels === 1 ? "mono" : "stereo"} ${(videoInfo.audio_sample_rate / 1000).toFixed(1)}kHz`
+                        : " no audio";
+                    ctx.font = "10px 'Segoe UI', sans-serif";
+                    const audioText = audioIcon + audioLabel;
+                    const audioW    = ctx.measureText(audioText).width;
+                    const audioCX   = x0 + W / 2;
+                    const GAP       = 10;   // min breathing room on each side
+
+                    const fits = audioCX - audioW / 2 > coordEndX + GAP &&
+                                 audioCX + audioW / 2 < metaStartX - GAP;
+
+                    if (fits) {
+                        ctx.fillStyle = videoInfo.has_audio ? C.infoText : C.infoDim;
+                        ctx.textAlign = "center";
+                        ctx.fillText(audioText, audioCX, iy + INFO_H / 2 + 4);
+                        ctx.textAlign = "left";
+                    } else {
+                        const coordW  = coordEndX - (x0 + 6);
+                        const sideW   = Math.max(coordW, tw);
+                        const needed  = Math.ceil(audioW + 2 * (PAD + 6 + GAP + sideW) + 8);
+                        if (needed > nodeWidth && needed > dynamicMinW) {
+                            dynamicMinW = needed;
+                            if (node.size[0] < needed) {
+                                node.setSize([needed, node.size[1]]);
+                                node.onResize?.(node.size);
+                            }
+                        }
+                    }
                 }
 
-                // ── Aspect-ratio dropdown overlay ────────────────────────
-                // Drawn last so it floats above everything else in this
-                // widget. Positioned centred horizontally, just above the
-                // Trim Mode / Crop bar (over the canvas/playback/trim area,
-                // which has plenty of room for the full list).
                 if (aspectDropdownOpen) {
                     dropdownW = DROPDOWN_W;
                     dropdownH = ASPECT_RATIOS.length * DROPDOWN_ITEM_H;
@@ -1126,9 +1229,6 @@ app.registerExtension({
                 }
 
                 // ── Resize-method dropdown overlay ───────────────────────
-                // Drawn last, floating above everything else. Positioned
-                // centred over the "Resize" button, just above the
-                // Trim Mode / Crop / Resize bar.
                 if (resizeDropdownOpen) {
                     resizeDropdownW = RESIZE_DROPDOWN_W;
                     resizeDropdownH = RESIZE_METHODS.length * DROPDOWN_ITEM_H;
@@ -1169,6 +1269,10 @@ app.registerExtension({
 
             // ── Mouse handler ─────────────────────────────────────────────
             mouse(event, pos, node) {
+                // computedHeight is the actual space assigned to this growable
+                // widget by LiteGraph's layout pass.
+                const canvasH = getCanvasH(this, node.size[0]);
+
                 // pos is [x, y] in node-local coordinates
                 const nx = pos[0];
                 const ny = pos[1];
@@ -1218,7 +1322,7 @@ app.registerExtension({
                 }
 
                 // ── Playback bar hit region ────────────────────────────
-                const pbY0 = this.last_y + dynamicCanvasH;
+                const pbY0 = this.last_y + canvasH;
                 const pbY1 = pbY0 + PLAYBACK_H;
 
                 if (ny >= pbY0 && ny <= pbY1) {
@@ -1231,11 +1335,7 @@ app.registerExtension({
                             togglePlayback();
                             return true;
                         }
-                        // Progress-bar scrub. The playback bar only ever seeks
-                        // (moves the play head) — it never writes trim_start/
-                        // trim_end. The trim handles drawn on this bar are a
-                        // read-only reference; drag them from the trim
-                        // timeline below to actually change the trim window.
+
                         if (videoEl && videoEl.duration > 0 &&
                             nx >= progBarX - 10 && nx <= progBarX + progBarW + 10) {
 
@@ -1253,7 +1353,6 @@ app.registerExtension({
                         const dur = videoEl.duration;
 
                         // Drag-scrub (pointer started in bar — buttons===1).
-                        // Seek only; never touches trim_start/trim_end.
                         if (nx >= progBarX - 8 && nx <= progBarX + progBarW + 8) {
                             const pct = clamp((nx - progBarX) / progBarW, 0, 1);
                             videoEl.currentTime = pct * dur;
@@ -1267,9 +1366,7 @@ app.registerExtension({
                     return false;
                 }
 
-                // ── Trim timeline: drag move/release follows cursor anywhere ─
-                // Once a drag is in progress, process moves and releases
-                // regardless of whether the cursor is still inside the strip.
+                // ── Trim timeline: drag move/release follows cursor anywhere ─.
                 if (timelineDrag) {
                     if (type === "pointerup" || type === "mouseup") {
                         timelineDrag = null;
@@ -1303,7 +1400,7 @@ app.registerExtension({
                 }
 
                 // ── Trim timeline hit region (pointerdown only) ────────
-                const tlY0 = this.last_y + dynamicCanvasH + PLAYBACK_H;
+                const tlY0 = this.last_y + canvasH + PLAYBACK_H;
                 const tlY1 = tlY0 + TRIM_BAR_H;
 
                 if (ny >= tlY0 && ny <= tlY1 && ny >= sliderBarY && ny <= sliderBarY + sliderBarH) {
@@ -1352,7 +1449,7 @@ app.registerExtension({
 
                 // ── "Trim Mode" toggle hit region (below the trim bar) ─────
                 const modeBarY0 = tlY1;
-                const modeBarY1 = modeBarY0 + MODE_BAR_H;
+                const modeBarY1 = modeBarY0 + getModeBarH(node.size[0]);
 
                 if (ny >= modeBarY0 && ny <= modeBarY1) {
                     if (type === "pointerdown" || type === "mousedown") {
@@ -1379,11 +1476,6 @@ app.registerExtension({
                                 const newVal = i === 0 ? "seconds" : "frames";
                                 const w = gw("trim_mode");
                                 if (w && w.value !== newVal) {
-                                    // Convert trim_start/trim_end so the same real-world
-                                    // window is preserved across the unit switch: read
-                                    // the current window in seconds under the OLD mode,
-                                    // flip the mode, then re-write it in the NEW mode's
-                                    // units via setTrimSeconds (which is mode-aware).
                                     const { start, end } = getTrimSeconds();
                                     w.value = newVal;
                                     w.callback?.call(w, newVal);
@@ -1402,13 +1494,10 @@ app.registerExtension({
 
                 // ── Canvas drag region ─────────────────────────────────
                 if (!previewImg) return false;
-
-                // Crop-preview mode shows the output frame; dragging makes no
-                // sense there, so forward nothing to the drag machinery.
                 if (cropPreviewMode) return false;
 
                 // Reject if outside the canvas strip
-                if (ny < this.last_y || ny > this.last_y + dynamicCanvasH) return false;
+                if (ny < this.last_y || ny > this.last_y + canvasH) return false;
                 if (nx < dOffX - 2   || nx > dOffX + dWidth + 2)     return false;
 
                 // ── Drag start ─────────────────────────────────────────
@@ -1483,44 +1572,11 @@ app.registerExtension({
         }; // end cropWidget
 
         // ── Attach the widget BEFORE the built-in numeric widgets ──────────
-        // We prepend it so it sits at the top of the node body.
         node.widgets.unshift(cropWidget);
 
-        // ── Shared helper: recompute dynamicCanvasH from a given node size ──
-        // Called from both onResize and draw() so the canvas always reflects
-        // the actual node dimensions, even mid-drag before onResize fires.
-        function recalcCanvasH(nodeW, nodeH) {
-            const titleH = (typeof LiteGraph !== "undefined"
-                ? LiteGraph.NODE_TITLE_HEIGHT : null) ?? 30;
-            const otherH = node.widgets.reduce((sum, w) => {
-                if (w === cropWidget) return sum;
-                try {
-                    const s = w.computeSize ? w.computeSize(nodeW) : null;
-                    return sum + (Array.isArray(s) ? (s[1] || 28) : 28);
-                } catch { return sum + 28; }
-            }, 0);
-            const available = nodeH - titleH - otherH - MODE_BAR_H - PLAYBACK_H - TRIM_BAR_H - INFO_H;
-            dynamicCanvasH  = Math.max(CANVAS_H, available);
-        }
-
-        // ── Resize hook: canvas grows, fixed bars stay put ─────────────────
-        // When the user drags a corner to enlarge the node, all extra vertical
-        // space goes to the video-preview canvas.  PLAYBACK_H and INFO_H are
-        // always fixed.  The canvas never shrinks below its initial CANVAS_H.
-        const _origOnResize = node.onResize?.bind(node);
-        node.onResize = function (size) {
-            if (_origOnResize) _origOnResize(size);
-
-            // Enforce minimum width during resize (mirrors the creation-time clamp).
-            if (size[0] < MIN_W) size[0] = MIN_W;
-
-            recalcCanvasH(size[0], size[1]);
-            lastNodeW = size[0];
-            lastNodeH = size[1];
-
-            node.setDirtyCanvas(true, false);
-        };
-
+        // Height is intentionally not managed by node.computeSize() or
+        // node.onResize(). The growable crop widget participates in LiteGraph's
+        // normal layout pass and receives the node's available body height.
 
         const uploadVideoBtn = node.addWidget("button", "📁  Upload Your Video", null, async () => {
             try {
@@ -1578,87 +1634,200 @@ app.registerExtension({
             }
         }, { serialize: false });
 
-        // ── "Preview Crop" toggle button ──────────────────────────────────
-        // Switches the canvas between full-frame-with-overlay and a letterboxed
-        // view of only the cropped region, so you can judge the output without
-        // running the full workflow.
-        const previewCropBtn = node.addWidget("button", "🔍  Preview Crop Output", null, () => {
-            if (!previewImg) {
-                showStatus("⚠  Upload or auto-load a video first.");
-                return;
-            }
-            cropPreviewMode = !cropPreviewMode;
-            previewCropBtn.name = cropPreviewMode
-                ? "⊞  Back to Full Frame"
-                : "🔍  Preview Crop Output";
-            node.setDirtyCanvas(true, false);
-        }, { serialize: false });
+        // ── Compact icon-button toolbar (replaces 4 stacked text buttons) ──
+        // Builds the current button descriptors fresh each frame/click so
+        // icon + label + active state always reflect live node state.
+        function getActionButtons() {
+            return [
+                {
+                    icon:  cropPreviewMode ? "⤢" : "🔍",
+                    label: cropPreviewMode ? "Full Frame" : "Crop",
+                    active: cropPreviewMode,
+                    onClick() {
+                        if (!previewImg) {
+                            showStatus("⚠  Upload or auto-load a video first.");
+                            return;
+                        }
+                        cropPreviewMode = !cropPreviewMode;
+                        node.setDirtyCanvas(true, false);
+                    },
+                },
+                {
+                    icon:  (isPlaying && trimPlaybackMode) ? "⏸" : "✂",
+                    label: (isPlaying && trimPlaybackMode) ? "Stop" : "Trim",
+                    active: isPlaying && trimPlaybackMode,
+                    onClick() {
+                        if (!videoEl) {
+                            showStatus("⚠  Upload or auto-load a video first.");
+                            return;
+                        }
+                        const trimMode = gw("trim_mode")?.value ?? "seconds";
+                        if (trimMode === "none") {
+                            showStatus("⚠  Set trim_mode to 'seconds' or 'frames' to use trim preview.");
+                            return;
+                        }
+                        toggleTrimPlayback();
+                    },
+                },
+                {
+                    icon:  "↺",
+                    label: "Reset Crop",
+                    active: false,
+                    onClick() {
+                        if (videoInfo.width > 0) {
+                            setCrop(0, 0, videoInfo.width, videoInfo.height);
+                        } else {
+                            showStatus("⚠  Load a preview first so the frame size is known.");
+                        }
+                    },
+                },
+                {
+                    icon:  "↺",
+                    label: "Reset Trim",
+                    active: false,
+                    onClick() {
+                        const trimMode = gw("trim_mode")?.value ?? "seconds";
+                        if (trimMode === "none") {
+                            showStatus("⚠  Set trim_mode to 'seconds' or 'frames' first.");
+                            return;
+                        }
+                        const dur = videoEl?.duration || videoInfo.duration || 0;
+                        if (dur <= 0) {
+                            showStatus("⚠  Load a preview first so the duration is known.");
+                            return;
+                        }
+                        const fps = videoInfo.fps || gw("fps")?.value || 30;
+                        const sw = gw("trim_start");
+                        const ew = gw("trim_end");
+                        if (trimMode === "frames") {
+                            const totalF = videoInfo.nb_frames || Math.round(dur * fps);
+                            if (sw) sw.value = 0;
+                            if (ew) ew.value = totalF;
+                        } else {
+                            if (sw) sw.value = 0;
+                            if (ew) ew.value = Math.round(dur * 100) / 100;
+                        }
+                        node.setDirtyCanvas(true, false);
+                    },
+                },
+            ];
+        }
 
-        // ── "Preview Trimmed Output" button ───────────────────────────────
-        // Plays the video from trim_start to trim_end so the user can preview
-        // the trimmed segment without running the full workflow.
-        const previewTrimBtn = node.addWidget("button", "✂  Preview Trimmed Output", null, () => {
-            if (!videoEl) {
-                showStatus("⚠  Upload or auto-load a video first.");
-                return;
-            }
-            const trimMode = gw("trim_mode")?.value ?? "seconds";
-            if (trimMode === "none") {
-                showStatus("⚠  Set trim_mode to 'seconds' or 'frames' to use trim preview.");
-                return;
-            }
-            toggleTrimPlayback();
-        }, { serialize: false });
+        const actionIconsWidget = {
+            type:    "icon_toolbar",
+            name:    "action_icons",
+            value:   null,
+            options: { serialize: false },
+            last_y:  0,
+            _rects:  [],
+            _hoverIdx: -1,
 
-        // ── "Reset Crop" button ────────────────────────────────────────────
-        const resetCropBtn = node.addWidget("button", "⊡  Reset Crop to Full Frame", null, () => {
-            if (videoInfo.width > 0) {
-                setCrop(0, 0, videoInfo.width, videoInfo.height);
-            } else {
-                showStatus("⚠  Load a preview first so the frame size is known.");
-            }
-        }, { serialize: false });
+            computeSize(nodeWidth) {
+                return [nodeWidth, ICONBAR_H];
+            },
 
-        // ── "Reset Trim to Full Video" button ──────────────────────────────
-        const resetTrimBtn = node.addWidget("button", "⊡  Reset Trim to Full Video", null, () => {
-            const trimMode = gw("trim_mode")?.value ?? "seconds";
-            if (trimMode === "none") {
-                showStatus("⚠  Set trim_mode to 'seconds' or 'frames' first.");
-                return;
-            }
-            const dur = videoEl?.duration || videoInfo.duration || 0;
-            if (dur <= 0) {
-                showStatus("⚠  Load a preview first so the duration is known.");
-                return;
-            }
-            const fps = videoInfo.fps || gw("fps")?.value || 30;
-            const sw = gw("trim_start");
-            const ew = gw("trim_end");
-            if (trimMode === "frames") {
-                const totalF = videoInfo.nb_frames || Math.round(dur * fps);
-                if (sw) sw.value = 0;
-                if (ew) ew.value = totalF;
-            } else {
-                if (sw) sw.value = 0;
-                if (ew) ew.value = Math.round(dur * 100) / 100;
-            }
-            node.setDirtyCanvas(true, false);
-        }, { serialize: false });
+            draw(ctx, node, nodeWidth, y) {
+                this.last_y = y;
+                const buttons = getActionButtons();
+                const n       = buttons.length;
+                const totalW  = nodeWidth - PAD * 2;
+                const btnW    = (totalW - ICONBAR_GAP * (n - 1)) / n;
+                const btnH    = ICONBAR_H - 10;
+                const btnY    = y + 5;
+                const radius  = 7;
 
-        // ── Reorder: keep these action buttons above the ffmpeg-flags text ──
-        // addWidget() always appends to the end of node.widgets, which puts
-        // them after any Python-defined widgets — including the multi-line
-        // ffmpeg-flags textbox. Move them back up so they sit directly below
-        // the last numeric widget (fps) and above that textbox.
+                this._rects = [];
+
+                ctx.save();
+                ctx.textBaseline = "middle";
+                ctx.textAlign    = "center";
+
+                buttons.forEach((b, i) => {
+                    const bx = PAD + i * (btnW + ICONBAR_GAP);
+                    this._rects.push({ x: bx, y: btnY, w: btnW, h: btnH });
+
+                    const hovered = this._hoverIdx === i && !b.active;
+
+                    ctx.beginPath();
+                    if (ctx.roundRect) ctx.roundRect(bx, btnY, btnW, btnH, radius);
+                    else ctx.rect(bx, btnY, btnW, btnH);
+                    ctx.fillStyle = b.active ? C.iconActiveBg : (hovered ? C.btnHover : C.btnBg);
+                    ctx.fill();
+                    ctx.lineWidth   = 1;
+                    ctx.strokeStyle = b.active ? C.iconActiveBord : C.bgBorder;
+                    ctx.stroke();
+
+                    const iconColor  = b.active ? C.iconActiveText : (hovered ? C.iconHoverText : C.btnText);
+                    const labelColor = b.active ? C.iconActiveText : (hovered ? C.iconHoverText : C.pbText);
+                    const midX = bx + btnW / 2;
+
+                    ctx.fillStyle = iconColor;
+                    ctx.font      = "13px 'Segoe UI', sans-serif";
+                    ctx.fillText(b.icon, midX, btnY + btnH / 2 - 6);
+
+                    ctx.fillStyle = labelColor;
+                    ctx.font      = "9px 'Segoe UI', sans-serif";
+                    ctx.fillText(b.label, midX, btnY + btnH / 2 + 8);
+                });
+
+                ctx.textAlign = "left";
+                ctx.restore();
+            },
+
+            mouse(event, pos, node) {
+                const nx = pos[0];
+                const ny = pos[1];
+                const type = event.type;
+
+                if (ny < this.last_y || ny > this.last_y + ICONBAR_H) {
+                    if (this._hoverIdx !== -1) {
+                        this._hoverIdx = -1;
+                        node.setDirtyCanvas(true, false);
+                    }
+                    return false;
+                }
+
+                let idx = -1;
+                for (let i = 0; i < this._rects.length; i++) {
+                    const r = this._rects[i];
+                    if (nx >= r.x && nx <= r.x + r.w && ny >= r.y && ny <= r.y + r.h) { idx = i; break; }
+                }
+
+                if (type === "pointermove" || type === "mousemove") {
+                    if (this._hoverIdx !== idx) {
+                        this._hoverIdx = idx;
+                        node.setDirtyCanvas(true, false);
+                    }
+                    return idx !== -1;
+                }
+
+                if (type === "pointerdown" || type === "mousedown") {
+                    if (idx !== -1) {
+                        getActionButtons()[idx].onClick();
+                        node.setDirtyCanvas(true, false);
+                        return true;
+                    }
+                    return false;
+                }
+
+                if (type === "pointerup" || type === "mouseup") {
+                    return idx !== -1;
+                }
+
+                return false;
+            },
+        };
+
+        // ── Reorder: keep these action widgets above the ffmpeg-flags text ──
         {
-            const actionButtons = [uploadVideoBtn, previewCropBtn, previewTrimBtn, resetCropBtn, resetTrimBtn];
-            for (const b of actionButtons) {
+            const actionWidgets = [uploadVideoBtn, actionIconsWidget];
+            for (const b of actionWidgets) {
                 const i = node.widgets.indexOf(b);
                 if (i !== -1) node.widgets.splice(i, 1);
             }
             const fpsIdx = node.widgets.findIndex(w => w.name === "fps");
             const insertAt = fpsIdx !== -1 ? fpsIdx + 1 : node.widgets.length;
-            node.widgets.splice(insertAt, 0, ...actionButtons);
+            node.widgets.splice(insertAt, 0, ...actionWidgets);
             node.setDirtyCanvas(true, true);
         }
 
@@ -1680,7 +1849,7 @@ app.registerExtension({
                 ctx.fillStyle = C.infoText;
                 ctx.font      = "12px 'Segoe UI', sans-serif";
                 ctx.textAlign = "center";
-                ctx.fillText(_statusMsg, x0 + W / 2, y + dynamicCanvasH / 2 + 36);
+                ctx.fillText(_statusMsg, x0 + W / 2, y + getCanvasH(cropWidget, nodeWidth) / 2 + 36);
                 ctx.textAlign = "left";
             }
         };
@@ -1706,8 +1875,6 @@ app.registerExtension({
                 img.onload = () => {
                     previewImg      = img;
                     cropPreviewMode = false;            // return to full-frame view
-                    if (previewCropBtn)                 // reset button label
-                        previewCropBtn.name = "🔍  Preview Crop Output";
 
                     // Populate video metadata
                     const info = data.info ?? {};
@@ -1723,31 +1890,27 @@ app.registerExtension({
                         audio_channels:   info.audio_channels    ?? 0,
                     };
 
-                    // Always reset crop to the new video's full frame on load.
-                    // A stale crop from a previous video would otherwise remain.
                     setCrop(0, 0, videoInfo.width, videoInfo.height);
+                    recalcInfoBarMinW();
+                    if (node.size[0] < dynamicMinW) {
+                        node.setSize([dynamicMinW, node.size[1]]);
+                        node.onResize?.(node.size);
+                    }
 
-                    // Default the aspect-ratio lock to whichever preset most
-                    // closely matches the loaded video, then fit the crop to it.
                     selectedAspect = closestAspectRatio(videoInfo.width, videoInfo.height);
                     applyAspectRatio(selectedAspect);
                     aspectDropdownOpen = false;
 
-                    // Sync fps widget with the video's native frame rate
                     const fpsW = gw("fps");
                     if (fpsW && videoInfo.fps > 0) {
                         fpsW.value = Math.round(videoInfo.fps * 1000) / 1000;
                     }
 
-                    // Write video_duration so the timeline and Python backend always
-                    // know the total clip length, even before playback starts.
                     const durW = gw("video_duration");
                     if (durW && videoInfo.duration > 0) {
                         durW.value = Math.round(videoInfo.duration * 1000) / 1000;
                     }
 
-                    // Always reset trim_start / trim_end to the full video range on
-                    // every load so stale values from a previous video are cleared.
                     {
                         const modeW  = gw("trim_mode");
                         const startW = gw("trim_start");
@@ -1781,11 +1944,6 @@ app.registerExtension({
                         node.setDirtyCanvas(true, false);
                     });
                     vel.addEventListener("canplay", () => {
-                        // Seek to start so the scrub head always shows 0 on new load.
-                        // { once: true } is critical: "canplay" also re-fires during
-                        // normal playback (after buffering/stalls), and without this
-                        // guard every re-fire snapped the video back to time 0,
-                        // making playback look completely broken.
                         vel.currentTime = 0;
                         node.setDirtyCanvas(true, false);
                     }, { once: true });
@@ -1803,17 +1961,15 @@ app.registerExtension({
         }
 
         // ── Enforce minimum node width ─────────────────────────────────────
+        node.resizable = true;
         const [curW, curH] = node.size;
-        node.setSize([Math.max(curW, MIN_W), curH]);
+        // Width is the only initial correction here. Height is synchronized
+        // after the backend-only widgets are hidden, so their suppressed layout
+        // height cannot participate in the initial node-size calculation.
+        node.setSize([Math.max(curW, dynamicMinW), curH]);
 
         // ── Hide backend-only widgets ──────────────────────────────────────
-        // video_path and video_duration are serialized by ComfyUI for the
-        // Python backend, but the UI manages their values automatically so
-        // they should not clutter the widget list with editable fields.
         queueMicrotask(() => {
-            // Sync the "Resize" button's initial selection from the native
-            // resize_method widget's value (e.g. a saved workflow), before
-            // that widget is hidden below.
             const rmW = gw("resize_method");
             if (rmW) {
                 const match = RESIZE_METHODS.find(m => m.val === rmW.value);
@@ -1821,10 +1977,6 @@ app.registerExtension({
                 else rmW.value = selectedResizeMethod.val;   // self-heal invalid value
             }
 
-            // trim_mode is hidden here too: it's now driven by the "Trim Mode"
-            // Seconds/Frames toggle drawn at the top of the canvas widget,
-            // not by the native combo dropdown. resize_method is likewise
-            // driven by the custom "Resize" button/dropdown.
             for (const name of ["video_path", "video_duration", "trim_mode", "resize_method"]) {
                 const w = gw(name);
                 if (w) {
@@ -1833,16 +1985,15 @@ app.registerExtension({
                     w.computeSize = () => [0, -4];   // suppress layout gap
                 }
             }
+
             node.setDirtyCanvas(true, true);
         });
 
-        // ── Auto-load preview when node is first created with a path set ───
-        // (Useful when duplicating a node or loading a saved workflow.)
         queueMicrotask(async () => {
             const pathW = gw("video_path");
             if (pathW?.value?.trim()) {
                 await loadPreview(pathW.value.trim());
             }
         });
-    }, // end nodeCreated
-}); // end registerExtension
+    },
+});
