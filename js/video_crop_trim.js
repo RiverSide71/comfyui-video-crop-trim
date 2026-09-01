@@ -54,9 +54,6 @@ const C = {
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const even  = v => Math.round(v) % 2 === 0 ? Math.round(v) : Math.round(v) - 1;
 
-// Greedily word-wrap `text` to fit within `maxWidth` using ctx's current font.
-// Never breaks a single word. Returns an array of lines (length 1 if the
-// whole string already fits).
 function wrapTextLines(ctx, text, maxWidth) {
     const words = text.split(" ");
     const lines = [];
@@ -74,15 +71,11 @@ function wrapTextLines(ctx, text, maxWidth) {
     return lines;
 }
 
-// Offscreen canvas shared by every node instance, used only to measure text
-// widths (ctx.measureText) when computing the info bar's required width.
-// Never drawn to the screen.
 const _measureCanvas = document.createElement("canvas");
 const _measureCtx    = _measureCanvas.getContext("2d");
 
 // ─── Crop aspect-ratio presets ───────────────────────────────────────────────
-// val: 0 = Freeform (no lock), -1 = Original (locked to the loaded video's
-// own native ratio), otherwise a fixed width/height ratio.
+
 const ASPECT_RATIOS = [
     { name: "Freeform", val: 0 },
     { name: "Original", val: -1 },
@@ -110,8 +103,6 @@ const RESIZE_METHODS = [
 ];
 const RESIZE_DROPDOWN_W = 100;
 
-// Find the fixed named ratio (excluding Freeform/Original) closest to a
-// given width/height — used to pick the default selection for a new video.
 function closestAspectRatio(w, h) {
     if (!w || !h) return ASPECT_RATIOS[0];
     const target = w / h;
@@ -129,8 +120,6 @@ function closestAspectRatio(w, h) {
 
 const STICKY_KEY     = "VideoCropTrim.lastSettings";
 const STICKY_WIDGETS = ["trim_mode", "output_format", "codec", "quality", "audio_mode"];
-// Class defaults, mirrored here so a widget can self-heal (e.g. if it's ever
-// found holding an invalid value like NaN) without needing to consult Python.
 const STICKY_DEFAULTS = {
     trim_mode:     "seconds",
     output_format: "mp4",
@@ -149,9 +138,6 @@ function loadStickySettings() {
 
 function saveStickySetting(name, value) {
     try {
-        // quality is numeric — clamp to its valid 0–51 range and refuse to
-        // persist anything that isn't a finite number, so a bad in-flight
-        // value can never get written back out and reappear on new nodes.
         if (name === "quality") {
             const n = Number(value);
             if (!Number.isFinite(n)) return;
@@ -161,8 +147,6 @@ function saveStickySetting(name, value) {
         cur[name] = value;
         localStorage.setItem(STICKY_KEY, JSON.stringify(cur));
     } catch {
-        // localStorage unavailable (private mode, quota, etc.) — not fatal,
-        // just means stickiness won't persist this session.
     }
 }
 
@@ -178,12 +162,6 @@ app.registerExtension({
         let videoInfo   = { width: 0, height: 0, fps: 30, duration: 0, nb_frames: 0, has_audio: false, audio_codec: null, audio_sample_rate: 0, audio_channels: 0 };
         let dynamicMinW = MIN_W;
 
-        // Growable-widget layout: LiteGraph allocates the actual height through
-        // widget.computedHeight. These controls consume the fixed portion.
-        // The mode bar's own height is width-dependent (it can wrap to two
-        // rows), so the fixed portion — and therefore the canvas height it
-        // leaves behind — is recomputed per current node width rather than
-        // being a static constant.
         const getCanvasH = (widget, nodeWidth) => {
             const h = Number(widget?.computedHeight);
             const fixedH = getModeBarH(nodeWidth) + PLAYBACK_H + TRIM_BAR_H + INFO_H;
@@ -215,9 +193,9 @@ app.registerExtension({
                 audioW = ctx.measureText(audioIcon + audioLabel).width;
             }
 
-            const GAP    = 10;   // min breathing room either side of the audio badge
-            const SIDE   = 6;    // inset from each edge of the info bar
-            const MARGIN = 8;    // safety buffer for font-metric differences across systems
+            const GAP    = 10;
+            const SIDE   = 6;
+            const MARGIN = 8;
             const sideW  = Math.max(coordW, metaW);
             const required = Math.ceil(audioW + 2 * (PAD + SIDE + GAP + sideW) + MARGIN);
             dynamicMinW = Math.max(MIN_W, required);
@@ -227,10 +205,9 @@ app.registerExtension({
         let lastNodeH = 0;
 
         // ── Playback state ──────────────────────────────────────────────────
-        let videoEl    = null;   // Off-screen <video> element (never in DOM)
+        let videoEl    = null;
         let isPlaying  = false;
         let rafId      = null;
-        // Cached progress-bar rect (node-local coords) for hit-testing
         let progBarX   = 0;
         let progBarW   = 0;
         let progBarY   = 0;
@@ -240,11 +217,11 @@ app.registerExtension({
         let modeToggleSegH   = 0;
         let modeToggleSegGap = 0;
         let trimPlaybackMode = false;
-        let selectedAspect     = ASPECT_RATIOS[0];   // Freeform until a video loads
+        let selectedAspect     = ASPECT_RATIOS[0];
         let aspectDropdownOpen = false;
         let cropBtnX = 0, cropBtnY = 0, cropBtnW = 0, cropBtnH = 0;
         let dropdownX = 0, dropdownY = 0, dropdownW = 0, dropdownH = 0;
-        let selectedResizeMethod = RESIZE_METHODS[0];   // "Crop" by default
+        let selectedResizeMethod = RESIZE_METHODS[0];
         let resizeDropdownOpen   = false;
         let resizeBtnX = 0, resizeBtnY = 0, resizeBtnW = 0, resizeBtnH = 0;
         let resizeDropdownX = 0, resizeDropdownY = 0, resizeDropdownW = 0, resizeDropdownH = 0;
@@ -253,29 +230,18 @@ app.registerExtension({
         let sliderBarY  = 0;
         let sliderBarH  = 0;
         let timelineDrag       = null;
-        let timelineDragOffset = 0;    // offset from handle to mouse (for "center" pan)
-        let timelineDragWidth  = 0;    // selection width at drag-start (for "center" pan)
+        let timelineDragOffset = 0;
+        let timelineDragWidth  = 0;
         let dScale  = 1;
-        let dOffX   = 0;   // In node-local coords
-        let dOffY   = 0;   // In node-local coords (includes widget.last_y)
+        let dOffX   = 0;
+        let dOffY   = 0;
         let dWidth  = 0;
         let dHeight = 0;
-        let cropPreviewMode = false;  // true = canvas shows only the cropped region
-        let dragMode        = null;   // null | "create" | "move" | "tl" | "tr" | "bl" | "br"
-        let dragAnchor = null;  // { x, y } in node-local coords where drag began
-        let dragCrop   = null;  // snapshot of crop at drag-start
+        let cropPreviewMode = false;
+        let dragMode        = null;
+        let dragAnchor = null;
+        let dragCrop   = null;
 
-        // ── Mode-bar responsive layout ───────────────────────────────────────
-        // The mode bar packs a left cluster ("Trim Mode" + Seconds/Frames) and
-        // a right cluster ("Resize"/"Crop" buttons) into one row. As the node
-        // gets too narrow to fit things without overlap, the bar grows rows:
-        //   1 row  — everything fits side-by-side (original layout).
-        //   2 rows — Trim Mode on row 1; Resize+Crop together on row 2.
-        //   3 rows — Trim Mode on row 1; Resize alone on row 2; Crop alone on
-        //            row 3 (row 2 wasn't wide enough for both buttons).
-        // These helpers use the shared off-screen measuring context, so they
-        // can be called from draw(), mouse(), and computeLayoutSize() alike
-        // without needing a live ctx.
         function modeBarLeftW(ctx) {
             ctx.font = "bold 11px 'Segoe UI', sans-serif";
             const modeLabelW = ctx.measureText("Trim Mode").width;
@@ -291,9 +257,6 @@ app.registerExtension({
         }
         function getModeBarRows(nodeWidth) {
             const ctx           = _measureCtx;
-            // Width usable by one row's content, after an 8px margin on each
-            // side plus 8px of breathing room (matches the 8px gap the
-            // buttons already use between each other / the row edge).
             const rowAvailable  = nodeWidth - PAD * 2 - 16;
             const leftW         = modeBarLeftW(ctx);
             const rightW        = modeBarResizeW(ctx) + 8 + modeBarCropW(ctx);
@@ -307,8 +270,6 @@ app.registerExtension({
 
         // ── Widget-finding helpers ──────────────────────────────────────────
         const gw = name => node.widgets?.find(w => w.name === name);
-
-        // ── Apply sticky last-used settings (falls back to class defaults) ──
 
         {
             const sticky = loadStickySettings();
@@ -332,7 +293,7 @@ app.registerExtension({
                     if (name === "quality") {
                         const n = Number(value);
                         value = Number.isFinite(n) ? clamp(Math.round(n), 0, 51) : STICKY_DEFAULTS.quality;
-                        this.value = value;   // keep the widget itself in range, never NaN
+                        this.value = value;
                     }
                     saveStickySetting(name, value);
                     return prevCallback?.call(this, value, ...rest);
@@ -533,11 +494,6 @@ app.registerExtension({
             options: { serialize: false },
             last_y:  0,
 
-            // IMPORTANT: use computeLayoutSize(), not computeSize().
-            // In ComfyUI's current LiteGraph, computeSize() widgets are fixed
-            // height and can cause the node itself to grow to accommodate them.
-            // computeLayoutSize() makes this widget grow into the node's existing
-            // free space instead, so node height never feeds back into sizing.
             computeLayoutSize() {
                 return {
                     minHeight: getModeBarH(node.size[0]) + CANVAS_H + PLAYBACK_H + TRIM_BAR_H + INFO_H,
@@ -549,14 +505,9 @@ app.registerExtension({
                 this.last_y = y;
                 const canvasH = getCanvasH(this, nodeWidth);
 
-                // Do NOT recalculate canvasH here. draw() must consume the
-                // same cached height that computeSize() just reported to LiteGraph.
-                // Recalculating from node.size during draw creates a one-frame
-                // layout/drawing mismatch and causes the widgets below to overlap.
-
-                const W  = nodeWidth - PAD * 2;   // usable width
-                const x0 = PAD;                    // left edge
-                const y0 = y;                      // top of canvas area
+                const W  = nodeWidth - PAD * 2;
+                const x0 = PAD;
+                const y0 = y;
 
                 // ── Background ─────────────────────────────────────────
                 ctx.fillStyle   = C.bg;
@@ -565,7 +516,6 @@ app.registerExtension({
                 ctx.fillRect(x0, y0, W, canvasH);
                 ctx.strokeRect(x0, y0, W, canvasH);
 
-                // Decide which image source to paint (live video or static first-frame)
                 const imgSrc = (videoEl && videoEl.readyState >= 2) ? videoEl : previewImg;
 
                 if (imgSrc) {
@@ -592,7 +542,6 @@ app.registerExtension({
                             destY = y0;
                         }
 
-                        // Draw only the cropped source region
                         ctx.drawImage(imgSrc, c.x, c.y, c.w, c.h, destX, destY, destW, destH);
 
                         // Rule-of-thirds grid over the full preview area
@@ -607,7 +556,7 @@ app.registerExtension({
                         }
                         ctx.stroke();
 
-                        // Dimension badge — top-left corner
+                        // Dimension badge - top-left corner
                         const badge = `  ${c.w} × ${c.h} px  `;
                         ctx.font      = "bold 11px monospace";
                         const badgeW  = ctx.measureText(badge).width + 2;
@@ -618,7 +567,7 @@ app.registerExtension({
                         ctx.textAlign = "left";
                         ctx.fillText(badge, destX + 1, destY + badgeH - 4);
 
-                        // "CROP OUTPUT" label — bottom centre
+                        // "CROP OUTPUT" label - bottom centre
                         ctx.font      = "10px 'Segoe UI', sans-serif";
                         ctx.fillStyle = C.infoDim;
                         ctx.textAlign = "center";
@@ -712,7 +661,7 @@ app.registerExtension({
 
                     ctx.textAlign = "center";
                     if (mainLines.length <= 1 && subLines.length <= 1) {
-                        // Fits on one line each — keep the original, exact layout.
+                        // Fits on one line each - keep the original, exact layout.
                         ctx.fillStyle = C.placeholder;
                         ctx.font      = "13px 'Segoe UI', sans-serif";
                         ctx.fillText(mainText, x0 + W / 2, y0 + canvasH / 2 - 10);
@@ -720,8 +669,6 @@ app.registerExtension({
                         ctx.font      = "11px monospace";
                         ctx.fillText(subText, x0 + W / 2, y0 + canvasH / 2 + 12);
                     } else {
-                        // Squeezed: wrap onto multiple lines and re-center as a block
-                        // so the text stays inside the canvas instead of overflowing it.
                         const MAIN_LH = 16, SUB_LH = 14, BLOCK_GAP = 8;
                         const totalH = mainLines.length * MAIN_LH + BLOCK_GAP + subLines.length * SUB_LH;
                         let ly = y0 + canvasH / 2 - totalH / 2 + MAIN_LH * 0.8;
@@ -897,7 +844,7 @@ app.registerExtension({
                     }
 
                 } else {
-                    // No video — draw empty track + placeholder text
+                    // No video - draw empty track + placeholder text
                     ctx.fillStyle = C.pbTrack;
                     ctx.beginPath();
                     ctx.roundRect(pbTrackX, pbTrackY, pbTrackW, pbTrackH, pbTrackH / 2);
@@ -1027,8 +974,6 @@ app.registerExtension({
                 }
 
                 // ── "Trim Mode" toggle bar (replaces the native trim_mode combo) ──
-                // Grows to 2 or 3 rows when the node is too narrow — see the
-                // getModeBarRows() comment above for the tiers.
                 const mbY         = ty + TRIM_BAR_H;
                 const modeBarRows = getModeBarRows(nodeWidth);
                 const modeBarH    = MODE_BAR_H * modeBarRows;
@@ -1085,14 +1030,6 @@ app.registerExtension({
                 });
                 ctx.textAlign    = "left";
                 ctx.textBaseline = "alphabetic";
-
-                // ── "Resize"/"Crop" buttons (right side, opposite Trim Mode) ─────
-                // rows===1: share row 1 with Trim Mode, right-aligned (original layout).
-                // rows===2: share their own row 2, right-aligned as a pair — this
-                //           only happens when the pair is known to fit (see
-                //           getModeBarRows), so no clamping is needed here.
-                // rows===3: row 2 wasn't wide enough for both, so each button
-                //           gets its own row, right-aligned individually.
                 const cropLabel   = `⛶  Crop: ${selectedAspect.name}  ▾`;
                 const resizeLabel = `Resize: ${selectedResizeMethod.name}  ▾`;
                 ctx.font = "11px 'Segoe UI', sans-serif";
@@ -1269,8 +1206,6 @@ app.registerExtension({
 
             // ── Mouse handler ─────────────────────────────────────────────
             mouse(event, pos, node) {
-                // computedHeight is the actual space assigned to this growable
-                // widget by LiteGraph's layout pass.
                 const canvasH = getCanvasH(this, node.size[0]);
 
                 // pos is [x, y] in node-local coordinates
@@ -1299,7 +1234,7 @@ app.registerExtension({
                         node.setDirtyCanvas(true, false);
                         return true;
                     }
-                    return true;   // swallow all other events while open
+                    return true;
                 }
 
                 // ── Aspect-ratio dropdown (overlay; highest hit-test priority) ──
@@ -1318,7 +1253,7 @@ app.registerExtension({
                         node.setDirtyCanvas(true, false);
                         return true;
                     }
-                    return true;   // swallow all other events while open
+                    return true;
                 }
 
                 // ── Playback bar hit region ────────────────────────────
@@ -1327,7 +1262,6 @@ app.registerExtension({
 
                 if (ny >= pbY0 && ny <= pbY1) {
                     if (type === "pointerdown" || type === "mousedown") {
-                        // Play/pause button — matches draw(): btnX = x0+6, btnSize = topRowH-10
                         const _topRowH = PLAYBACK_H - 4 - 1;
                         const btnSize  = _topRowH - 10;
                         const btnX     = PAD + 6;
@@ -1351,8 +1285,6 @@ app.registerExtension({
                             videoEl && videoEl.duration > 0) {
 
                         const dur = videoEl.duration;
-
-                        // Drag-scrub (pointer started in bar — buttons===1).
                         if (nx >= progBarX - 8 && nx <= progBarX + progBarW + 8) {
                             const pct = clamp((nx - progBarX) / progBarW, 0, 1);
                             videoEl.currentTime = pct * dur;
@@ -1366,7 +1298,6 @@ app.registerExtension({
                     return false;
                 }
 
-                // ── Trim timeline: drag move/release follows cursor anywhere ─.
                 if (timelineDrag) {
                     if (type === "pointerup" || type === "mouseup") {
                         timelineDrag = null;
@@ -1421,13 +1352,11 @@ app.registerExtension({
                         } else if (Math.abs(nx - endPx) <= HANDLE_HIT) {
                             timelineDrag = "end";
                         } else if (nx > startPx + HANDLE_HIT && nx < endPx - HANDLE_HIT) {
-                            // Click inside the selected region — pan the whole window
                             timelineDrag = "center";
                             const clickVal = ((nx - sliderBarX) / sliderBarW) * activeDur;
                             timelineDragOffset = clickVal - trimStartS;
                             timelineDragWidth  = effectiveEnd - trimStartS;
                         } else {
-                            // Click outside selection — move nearest handle
                             const clickVal = ((nx - sliderBarX) / sliderBarW) * activeDur;
                             if (Math.abs(clickVal - trimStartS) < Math.abs(clickVal - effectiveEnd)) {
                                 timelineDrag = "start";
@@ -1453,7 +1382,7 @@ app.registerExtension({
 
                 if (ny >= modeBarY0 && ny <= modeBarY1) {
                     if (type === "pointerdown" || type === "mousedown") {
-                        // "Resize" button — opens the resize-method dropdown
+                        // "Resize" button - opens the resize-method dropdown
                         if (nx >= resizeBtnX && nx <= resizeBtnX + resizeBtnW &&
                             ny >= resizeBtnY && ny <= resizeBtnY + resizeBtnH) {
                             resizeDropdownOpen = true;
@@ -1461,7 +1390,7 @@ app.registerExtension({
                             node.setDirtyCanvas(true, false);
                             return true;
                         }
-                        // "Crop" button — opens the aspect-ratio dropdown
+                        // "Crop" button - opens the aspect-ratio dropdown
                         if (nx >= cropBtnX && nx <= cropBtnX + cropBtnW &&
                             ny >= cropBtnY && ny <= cropBtnY + cropBtnH) {
                             aspectDropdownOpen = true;
@@ -1574,10 +1503,6 @@ app.registerExtension({
         // ── Attach the widget BEFORE the built-in numeric widgets ──────────
         node.widgets.unshift(cropWidget);
 
-        // Height is intentionally not managed by node.computeSize() or
-        // node.onResize(). The growable crop widget participates in LiteGraph's
-        // normal layout pass and receives the node's available body height.
-
         const uploadVideoBtn = node.addWidget("button", "📁  Upload Your Video", null, async () => {
             try {
                 const input = document.createElement("input");
@@ -1635,8 +1560,6 @@ app.registerExtension({
         }, { serialize: false });
 
         // ── Compact icon-button toolbar (replaces 4 stacked text buttons) ──
-        // Builds the current button descriptors fresh each frame/click so
-        // icon + label + active state always reflect live node state.
         function getActionButtons() {
             return [
                 {
@@ -1963,9 +1886,6 @@ app.registerExtension({
         // ── Enforce minimum node width ─────────────────────────────────────
         node.resizable = true;
         const [curW, curH] = node.size;
-        // Width is the only initial correction here. Height is synchronized
-        // after the backend-only widgets are hidden, so their suppressed layout
-        // height cannot participate in the initial node-size calculation.
         node.setSize([Math.max(curW, dynamicMinW), curH]);
 
         // ── Hide backend-only widgets ──────────────────────────────────────
@@ -1982,7 +1902,7 @@ app.registerExtension({
                 if (w) {
                     w.hidden = true;
                     w.type   = "hidden";
-                    w.computeSize = () => [0, -4];   // suppress layout gap
+                    w.computeSize = () => [0, -4];
                 }
             }
 
