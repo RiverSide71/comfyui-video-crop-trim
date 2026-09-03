@@ -370,7 +370,7 @@ app.registerExtension({
 
         const applyAspectRatio = (ratioObj) => {
             if (!videoInfo.width || !videoInfo.height) return;
-            if (!ratioObj || ratioObj.val === 0) return;   // Freeform: leave as-is
+            if (!ratioObj || ratioObj.val === 0) return;
             const ratio = ratioObj.val === -1
                 ? videoInfo.width / videoInfo.height
                 : ratioObj.val;
@@ -713,7 +713,7 @@ app.registerExtension({
 
                 // ── Row 1: play/pause button + time label ───────────────
                 const topRowH  = PLAYBACK_H - pbTrackH - 1;
-                const btnSize  = topRowH - 10;   // smaller play/pause button
+                const btnSize  = topRowH - 10;
                 const btnX     = x0 + 6;
                 const btnY     = py + (topRowH - btnSize) / 2;
 
@@ -1107,7 +1107,7 @@ app.registerExtension({
                     const audioText = audioIcon + audioLabel;
                     const audioW    = ctx.measureText(audioText).width;
                     const audioCX   = x0 + W / 2;
-                    const GAP       = 10;   // min breathing room on each side
+                    const GAP       = 10;
 
                     const fits = audioCX - audioW / 2 > coordEndX + GAP &&
                                  audioCX + audioW / 2 < metaStartX - GAP;
@@ -1424,8 +1424,6 @@ app.registerExtension({
                 // ── Canvas drag region ─────────────────────────────────
                 if (!previewImg) return false;
                 if (cropPreviewMode) return false;
-
-                // Reject if outside the canvas strip
                 if (ny < this.last_y || ny > this.last_y + canvasH) return false;
                 if (nx < dOffX - 2   || nx > dOffX + dWidth + 2)     return false;
 
@@ -1498,7 +1496,7 @@ app.registerExtension({
 
                 return false;
             },
-        }; // end cropWidget
+        };
 
         // ── Attach the widget BEFORE the built-in numeric widgets ──────────
         node.widgets.unshift(cropWidget);

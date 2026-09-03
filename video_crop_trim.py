@@ -3,8 +3,7 @@ Video Crop & Trim (FFmpeg) - ComfyUI Custom Node
 -------------------------------------------------
 Provides pixel-precise visual cropping and time/frame-range trimming
 of video files.  Accepts either a connected IMAGE tensor (frames) or
-a raw file path typed directly into the node, so no separate Load Video
-node is required.  An optional AUDIO input lets it take the images/audio
+a raw file path typed directly into the node.  An optional AUDIO input lets it take the images/audio
 pair straight out of a "Get Video Components" node.
 
 A lightweight HTTP endpoint (/videocropptrim/preview_frame) is also
@@ -450,16 +449,11 @@ class VideoCropTrim:
             )
 
             # ── 5. Audio extraction ─────────────────────────────────────
-            # Build audio data to satisfy the AUDIO return slot.
-            # When audio_mode is "strip" (or no audio is available) we
-            # return None so downstream nodes gracefully receive nothing.
+
             audio_data: dict | None = None
 
             if audio_mode == "extract":
                 if audio is not None:
-                    # A separate AUDIO input was connected directly (e.g. from
-                    # a "Get Video Components" node) — trim it to match the
-                    # kept video window instead of extracting from a file.
                     try:
                         audio_data = _trim_audio_tensor(audio, start_s, end_s)
                     except Exception as exc:
@@ -469,9 +463,7 @@ class VideoCropTrim:
                             f"input — AUDIO output will be None.\n{exc}",
                             stacklevel=2,
                         )
-                elif images is None:
-                    # No AUDIO input was connected and frames came from a file
-                    # path — probe and extract the trimmed audio from it.
+                elif images is None:.
                     source_info = _probe_video(input_path)
                     if not source_info.get("has_audio", False):
                         import warnings
@@ -481,8 +473,6 @@ class VideoCropTrim:
                             stacklevel=2,
                         )
                     else:
-                        # Extract the *trimmed* audio segment as 16-bit stereo WAV.
-                        # We reuse input_kwargs so the same ss/to window applies.
                         try:
                             audio_path = os.path.join(tmp, "audio.wav")
                             audio_in   = ffmpeg.input(input_path, **input_kwargs).audio
@@ -505,8 +495,6 @@ class VideoCropTrim:
                                 f"AUDIO output will be None.\nFFmpeg stderr: {stderr}",
                                 stacklevel=2,
                             )
-                # else: frames came from a connected IMAGE tensor and no AUDIO
-                # input was provided — nothing to extract, AUDIO stays None.
 
             # ── 6. Return frames + audio ────────────────────────────────
             tensor = _video_to_tensor(output_path, tmp)

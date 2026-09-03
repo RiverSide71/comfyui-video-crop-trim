@@ -19,8 +19,8 @@ A ComfyUI custom node for pixel-precise, interactive video cropping and time-ran
 - Rule-of-thirds grid always visible inside the crop region
 
 **Crop output preview**
-- Press **🔍 Preview Crop Output** to fill the canvas with only the cropped region, letterboxed to the correct aspect ratio, so you can verify framing before running the workflow
-- Press **⊞ Back to Full Frame** to return to the editor
+- Press **🔍 Preview Crop Output** button to fill the canvas with only the cropped region, letterboxed to the correct aspect ratio, so you can verify framing before running the workflow
+- Press **⊞ Back to Full Frame** button to return to the editor
 
 **Playback**
 - Off-screen `<video>` element streams the source file directly in the node
@@ -45,7 +45,7 @@ A ComfyUI custom node for pixel-precise, interactive video cropping and time-ran
 
 **Node resizing**
 - The preview canvas scales with the node; drag any corner to give yourself more room
-- Minimum width is enforced
+- Minimizing node width folds some menus
 
 ---
 
