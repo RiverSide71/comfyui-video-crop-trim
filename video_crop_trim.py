@@ -463,7 +463,7 @@ class VideoCropTrim:
                             f"input — AUDIO output will be None.\n{exc}",
                             stacklevel=2,
                         )
-                elif images is None:.
+                elif images is None:
                     source_info = _probe_video(input_path)
                     if not source_info.get("has_audio", False):
                         import warnings
